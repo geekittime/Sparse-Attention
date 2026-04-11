@@ -1,21 +1,16 @@
 import torch
 import flashinfer.decode
-import triton
-import triton.language as tl
 
 _WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
 _workspace_cache = {}
-_seq_lens_cache = {}
-_lse_partial_cache = {}
-_triton_lse_disabled = set()
+_cat_buffer_cache = {}
 
 QK_NOPE_HEAD_DIM = 128
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
 TOPK = 2048
 _LOG2E = 1.4426950408889634
-_LSE_BLOCK_N = 64
-_LSE_NUM_BLOCKS = TOPK // _LSE_BLOCK_N
+_LSE_CHUNK_SIZE = 32
 
 
 def _get_workspace(device):
@@ -27,32 +22,39 @@ def _get_workspace(device):
     return buf
 
 
-def _get_lse_partials(device, num_tokens):
-    key = (str(device), num_tokens)
-    cached = _lse_partial_cache.get(key)
+def _get_cat_buffers(q_nope, ckv_cache):
+    num_tokens = q_nope.shape[0]
+    num_pages = ckv_cache.shape[0]
+    key = (str(q_nope.device), q_nope.dtype, ckv_cache.dtype)
+    cached = _cat_buffer_cache.get(key)
     if cached is None:
-        shape = (num_tokens, 16, _LSE_NUM_BLOCKS)
-        partial_m = torch.empty(shape, dtype=torch.float32, device=device)
-        partial_d = torch.empty(shape, dtype=torch.float32, device=device)
-        cached = (partial_m, partial_d)
-        _lse_partial_cache[key] = cached
-    return cached
+        query_buf = torch.empty(
+            (num_tokens, 16, KV_LORA_RANK + QK_ROPE_HEAD_DIM),
+            dtype=q_nope.dtype,
+            device=q_nope.device,
+        )
+        kv_buf = torch.empty(
+            (num_pages, 64, KV_LORA_RANK + QK_ROPE_HEAD_DIM),
+            dtype=ckv_cache.dtype,
+            device=ckv_cache.device,
+        )
+    else:
+        query_buf, kv_buf = cached
+        if query_buf.shape[0] < num_tokens:
+            query_buf = torch.empty(
+                (num_tokens, 16, KV_LORA_RANK + QK_ROPE_HEAD_DIM),
+                dtype=q_nope.dtype,
+                device=q_nope.device,
+            )
+        if kv_buf.shape[0] < num_pages:
+            kv_buf = torch.empty(
+                (num_pages, 64, KV_LORA_RANK + QK_ROPE_HEAD_DIM),
+                dtype=ckv_cache.dtype,
+                device=ckv_cache.device,
+            )
 
-
-def _get_full_seq_lens(device, num_tokens):
-    key = (str(device), num_tokens)
-    cached = _seq_lens_cache.get(key)
-    if cached is None:
-        cached = torch.full((num_tokens,), TOPK, dtype=torch.int32, device=device)
-        _seq_lens_cache[key] = cached
-    return cached
-
-
-def _get_seq_lens(sparse_indices):
-    num_tokens = sparse_indices.shape[0]
-    if bool((sparse_indices[:, -1] != -1).all().item()):
-        return _get_full_seq_lens(sparse_indices.device, num_tokens)
-    return (sparse_indices != -1).sum(dim=1).to(torch.int32)
+    _cat_buffer_cache[key] = (query_buf, kv_buf)
+    return query_buf[:num_tokens], kv_buf[:num_pages]
 
 
 def _as_float(scale):
@@ -61,121 +63,36 @@ def _as_float(scale):
     return float(scale)
 
 
-@triton.jit
-def _lse_stage1_kernel(
+def _compute_lse_fast(
     q_nope,
     q_pe,
     ckv_cache,
     kpe_cache,
     sparse_indices,
-    partial_m,
-    partial_d,
-    sm_scale: tl.constexpr,
-    TOPK_C: tl.constexpr,
-    D_CKV: tl.constexpr,
-    D_KPE: tl.constexpr,
-    NUM_BLOCKS: tl.constexpr,
-    HAS_INVALID: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    token_id = tl.program_id(0)
-    block_id = tl.program_id(1)
-
-    offs_h = tl.arange(0, 16)
-    offs_n = block_id * BLOCK_N + tl.arange(0, BLOCK_N)
-    raw_idx = tl.load(sparse_indices + token_id * TOPK_C + offs_n)
-    valid_n = raw_idx >= 0
-    if not HAS_INVALID:
-        valid_n = offs_n < TOPK_C
-    safe_idx = tl.where(valid_n, raw_idx, 0)
-
-    logits = tl.zeros((16, BLOCK_N), dtype=tl.float32)
-
-    for d_start in tl.static_range(0, D_CKV, BLOCK_D):
-        offs_d = d_start + tl.arange(0, BLOCK_D)
-        q = tl.load(
-            q_nope + token_id * 16 * D_CKV + offs_h[:, None] * D_CKV + offs_d[None, :]
-        )
-        k = tl.load(ckv_cache + safe_idx[:, None] * D_CKV + offs_d[None, :])
-        logits += tl.dot(q, tl.trans(k), out_dtype=tl.float32)
-
-    offs_pe = tl.arange(0, D_KPE)
-    qpe = tl.load(
-        q_pe
-        + token_id * 16 * D_KPE
-        + offs_h[:, None] * D_KPE
-        + offs_pe[None, :]
-    )
-    kpe = tl.load(kpe_cache + safe_idx[:, None] * D_KPE + offs_pe[None, :])
-    logits += tl.dot(qpe, tl.trans(kpe), out_dtype=tl.float32)
-
-    logits = logits * (sm_scale * _LOG2E)
-    logits = tl.where(valid_n[None, :], logits, -float("inf"))
-    m = tl.max(logits, axis=1)
-    m_safe = tl.where(m == -float("inf"), 0.0, m)
-    d = tl.sum(tl.where(valid_n[None, :], tl.exp2(logits - m_safe[:, None]), 0.0), axis=1)
-
-    out_offsets = (token_id * 16 + offs_h) * NUM_BLOCKS + block_id
-    tl.store(partial_m + out_offsets, m)
-    tl.store(partial_d + out_offsets, d)
-
-
-@triton.jit
-def _lse_stage2_kernel(
-    partial_m,
-    partial_d,
+    sm_scale,
     lse,
-    BLOCKS: tl.constexpr,
 ):
-    token_id = tl.program_id(0)
-    head_id = tl.program_id(1)
-    offs = tl.arange(0, BLOCKS)
-    base = (token_id * 16 + head_id) * BLOCKS
-    m = tl.load(partial_m + base + offs)
-    d = tl.load(partial_d + base + offs)
-    m_final = tl.max(m, axis=0)
-    m_safe = tl.where(m_final == -float("inf"), 0.0, m_final)
-    d_final = tl.sum(d * tl.exp2(m - m_safe), axis=0)
-    lse_val = m_final + tl.log2(d_final)
-    tl.store(lse + token_id * 16 + head_id, lse_val)
-
-
-def _compute_lse_triton(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, lse):
+    k_ckv_all = ckv_cache.reshape(-1, KV_LORA_RANK)
+    k_pe_all = kpe_cache.reshape(-1, QK_ROPE_HEAD_DIM)
     num_tokens = q_nope.shape[0]
-    device = q_nope.device
-    if str(device) in _triton_lse_disabled:
-        return False
 
-    partial_m, partial_d = _get_lse_partials(device, num_tokens)
-    _lse_stage1_kernel[(num_tokens, _LSE_NUM_BLOCKS)](
-        q_nope,
-        q_pe,
-        ckv_cache,
-        kpe_cache,
-        sparse_indices,
-        partial_m,
-        partial_d,
-        sm_scale,
-        TOPK,
-        KV_LORA_RANK,
-        QK_ROPE_HEAD_DIM,
-        _LSE_NUM_BLOCKS,
-        True,
-        BLOCK_N=_LSE_BLOCK_N,
-        BLOCK_D=64,
-        num_warps=4,
-        num_stages=3,
-    )
-    _lse_stage2_kernel[(num_tokens, 16)](
-        partial_m,
-        partial_d,
-        lse,
-        BLOCKS=_LSE_NUM_BLOCKS,
-        num_warps=1,
-        num_stages=1,
-    )
-    return True
+    for start in range(0, num_tokens, _LSE_CHUNK_SIZE):
+        end = min(start + _LSE_CHUNK_SIZE, num_tokens)
+        idx = sparse_indices[start:end]
+        valid = idx != -1
+        safe_idx = torch.where(valid, idx, torch.zeros_like(idx)).to(torch.long)
+
+        k_ckv = k_ckv_all[safe_idx]
+        k_pe = k_pe_all[safe_idx]
+        qn = q_nope[start:end]
+        qp = q_pe[start:end]
+
+        logits = torch.einsum("bhd,bkd->bhk", qn, k_ckv).to(torch.float32)
+        logits += torch.einsum("bhd,bkd->bhk", qp, k_pe).to(torch.float32)
+        logits *= sm_scale
+        logits.masked_fill_(~valid[:, None, :], -float("inf"))
+
+        lse[start:end].copy_(torch.logsumexp(logits, dim=-1) * _LOG2E)
 
 
 def _compute_reference_outputs(
@@ -208,7 +125,7 @@ def _compute_reference_outputs(
         logits = torch.einsum("bhd,bkd->bhk", qn, k_ckv)
         logits += torch.einsum("bhd,bkd->bhk", qp, k_pe)
         logits *= sm_scale
-        logits = logits.masked_fill(~valid[:, None, :], -float("inf"))
+        logits.masked_fill_(~valid[:, None, :], -float("inf"))
 
         lse[start:end].copy_(torch.logsumexp(logits, dim=-1) * _LOG2E)
 
@@ -233,14 +150,16 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     if num_tokens == 0:
         return None
 
-    query = torch.cat([q_nope, q_pe], dim=-1).unsqueeze(1)  # [T, 1, H, ckv+kpe]
-    kv_cache = torch.cat([ckv_cache, kpe_cache], dim=-1)    # [num_pages, page_size, ckv+kpe]
+    query_buf, kv_cache = _get_cat_buffers(q_nope, ckv_cache)
+    torch.cat([q_nope, q_pe], dim=-1, out=query_buf)
+    torch.cat([ckv_cache, kpe_cache], dim=-1, out=kv_cache)
+    query = query_buf.unsqueeze(1)                          # [T, 1, H, ckv+kpe]
     block_tables = sparse_indices.unsqueeze(1)              # [T, 1, topk]
 
     # seq_lens = number of valid (non -1) entries per token
     # The kernel only reads the first seq_lens entries from block_tables;
     # valid entries are already contiguous at the front.
-    seq_lens = _get_seq_lens(sparse_indices)
+    seq_lens = (sparse_indices != -1).sum(dim=1).to(torch.int32)
     max_seq_len = TOPK
     workspace = _get_workspace(device)
 
@@ -280,39 +199,14 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
             True,
         )
     else:
-        try:
-            if not _compute_lse_triton(
-                q_nope,
-                q_pe,
-                ckv_cache,
-                kpe_cache,
-                sparse_indices,
-                bmm1_scale,
-                lse,
-            ):
-                _compute_reference_outputs(
-                    q_nope,
-                    q_pe,
-                    ckv_cache,
-                    kpe_cache,
-                    sparse_indices,
-                    bmm1_scale,
-                    output,
-                    lse,
-                    False,
-                )
-        except Exception:
-            _triton_lse_disabled.add(str(device))
-            _compute_reference_outputs(
-                q_nope,
-                q_pe,
-                ckv_cache,
-                kpe_cache,
-                sparse_indices,
-                bmm1_scale,
-                output,
-                lse,
-                False,
-            )
+        _compute_lse_fast(
+            q_nope,
+            q_pe,
+            ckv_cache,
+            kpe_cache,
+            sparse_indices,
+            bmm1_scale,
+            lse,
+        )
 
     return None
