@@ -4,13 +4,16 @@ import flashinfer.decode
 _WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
 _workspace_cache = {}
 _cat_buffer_cache = {}
+_device_info_cache = {}
+_trtllm_decode = None
+_direct_sparse_decode = None
 
 QK_NOPE_HEAD_DIM = 128
 KV_LORA_RANK = 512
 QK_ROPE_HEAD_DIM = 64
 TOPK = 2048
 _LOG2E = 1.4426950408889634
-_LSE_CHUNK_SIZE = 32
+_LSE_CHUNK_SIZE = 128
 
 
 def _get_workspace(device):
@@ -57,6 +60,18 @@ def _get_cat_buffers(q_nope, ckv_cache):
     return query_buf[:num_tokens], kv_buf[:num_pages]
 
 
+def _get_device_info(device):
+    key = str(device)
+    cached = _device_info_cache.get(key)
+    if cached is None:
+        cached = (
+            flashinfer.decode.get_device_sm_count(device),
+            flashinfer.decode.device_support_pdl(device),
+        )
+        _device_info_cache[key] = cached
+    return cached
+
+
 def _as_float(scale):
     if isinstance(scale, torch.Tensor):
         return float(scale.item())
@@ -68,7 +83,8 @@ def _compute_lse_fast(
     q_pe,
     ckv_cache,
     kpe_cache,
-    sparse_indices,
+    safe_indices,
+    valid_indices,
     sm_scale,
     lse,
 ):
@@ -78,12 +94,11 @@ def _compute_lse_fast(
 
     for start in range(0, num_tokens, _LSE_CHUNK_SIZE):
         end = min(start + _LSE_CHUNK_SIZE, num_tokens)
-        idx = sparse_indices[start:end]
-        valid = idx != -1
-        safe_idx = torch.where(valid, idx, torch.zeros_like(idx)).to(torch.long)
+        idx = safe_indices[start:end]
+        valid = valid_indices[start:end]
 
-        k_ckv = k_ckv_all[safe_idx]
-        k_pe = k_pe_all[safe_idx]
+        k_ckv = k_ckv_all[idx]
+        k_pe = k_pe_all[idx]
         qn = q_nope[start:end]
         qp = q_pe[start:end]
 
@@ -141,6 +156,71 @@ def _compute_reference_outputs(
             output[start:end].copy_(out.to(output.dtype))
 
 
+def _run_flashinfer_decode(
+    query,
+    kv_cache,
+    workspace,
+    block_tables,
+    seq_lens,
+    bmm1_scale,
+    output,
+):
+    global _trtllm_decode, _direct_sparse_decode
+
+    if _trtllm_decode is None:
+        _trtllm_decode = flashinfer.decode.get_trtllm_gen_fmha_module().trtllm_paged_attention_decode
+
+    sm_count, enable_pdl = _get_device_info(query.device)
+    workspace_size = workspace.numel() * workspace.element_size()
+
+    if _direct_sparse_decode is not False:
+        try:
+            _trtllm_decode(
+                output,
+                None,
+                query,
+                kv_cache,
+                kv_cache,
+                workspace,
+                block_tables,
+                seq_lens,
+                TOPK,
+                bmm1_scale,
+                1.0,
+                -1,
+                -1,
+                0,
+                -1,
+                sm_count,
+                enable_pdl,
+                workspace_size,
+                None,
+                TOPK,
+            )
+            _direct_sparse_decode = True
+            return True
+        except TypeError:
+            _direct_sparse_decode = False
+        except ValueError:
+            _direct_sparse_decode = False
+
+    flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        query=query,
+        kv_cache=kv_cache,
+        workspace_buffer=workspace,
+        qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+        kv_lora_rank=KV_LORA_RANK,
+        qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+        block_tables=block_tables,
+        seq_lens=seq_lens,
+        max_seq_len=TOPK,
+        out=output,
+        sparse_mla_top_k=TOPK,
+        bmm1_scale=bmm1_scale,
+    )
+    return True
+
+
 def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse):
     num_tokens = q_nope.shape[0]
     device = q_nope.device
@@ -156,27 +236,20 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     query = query_buf.unsqueeze(1)                          # [T, 1, H, ckv+kpe]
     block_tables = sparse_indices.unsqueeze(1)              # [T, 1, topk]
 
-    # seq_lens = number of valid (non -1) entries per token
-    # The kernel only reads the first seq_lens entries from block_tables;
-    # valid entries are already contiguous at the front.
-    seq_lens = (sparse_indices != -1).sum(dim=1).to(torch.int32)
-    max_seq_len = TOPK
+    valid_indices = sparse_indices != -1
+    seq_lens = valid_indices.sum(dim=1).to(torch.int32)
+    safe_indices = torch.where(valid_indices, sparse_indices, 0).to(torch.long)
     workspace = _get_workspace(device)
 
     try:
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
-            query=query,
-            kv_cache=kv_cache,
-            workspace_buffer=workspace,
-            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
-            kv_lora_rank=KV_LORA_RANK,
-            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            max_seq_len=max_seq_len,
-            out=output,
-            sparse_mla_top_k=TOPK,
-            bmm1_scale=bmm1_scale,
+        _run_flashinfer_decode(
+            query,
+            kv_cache,
+            workspace,
+            block_tables,
+            seq_lens,
+            bmm1_scale,
+            output,
         )
         compute_output = False
     except TypeError as exc:
@@ -204,7 +277,8 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
             q_pe,
             ckv_cache,
             kpe_cache,
-            sparse_indices,
+            safe_indices,
+            valid_indices,
             bmm1_scale,
             lse,
         )
