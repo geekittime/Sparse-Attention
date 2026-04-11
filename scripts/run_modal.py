@@ -50,7 +50,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             iterations=5,
             num_trials=1,
             timeout_seconds=300,
-            profile_baseline=False,
+            profile_baseline=True,
         )
 
     import logging
