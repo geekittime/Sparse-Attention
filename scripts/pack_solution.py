@@ -41,6 +41,7 @@ def pack_solution(output_path: Path = None) -> Path:
     language = build_config["language"]
     entry_point = build_config["entry_point"]
     binding = build_config.get("binding", None)
+    destination_passing_style = build_config.get("destination_passing_style", True)
 
     # Determine source directory based on language
     if language == "triton":
@@ -58,6 +59,7 @@ def pack_solution(output_path: Path = None) -> Path:
         language=language,
         target_hardware=["cuda"],
         entry_point=entry_point,
+        destination_passing_style=destination_passing_style,
     )
     if binding is not None:
         spec_kwargs["binding"] = binding
@@ -76,7 +78,7 @@ def pack_solution(output_path: Path = None) -> Path:
     if output_path is None:
         output_path = PROJECT_ROOT / "solution.json"
 
-    output_path.write_text(solution.model_dump_json(indent=2))
+    output_path.write_text(solution.model_dump_json(indent=2), encoding="utf-8")
     print(f"Solution packed: {output_path}")
     print(f"  Name: {solution.name}")
     print(f"  Definition: {solution.definition}")
