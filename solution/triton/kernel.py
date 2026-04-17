@@ -1,9 +1,13 @@
 import torch
 import flashinfer.decode
+import triton
+import triton.language as tl
 
 _WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
 _workspace_cache = {}
 _cat_buffer_cache = {}
+_index_buffer_cache = {}
+_offset_cache = {}
 
 QK_NOPE_HEAD_DIM = 128
 KV_LORA_RANK = 512
@@ -11,8 +15,24 @@ QK_ROPE_HEAD_DIM = 64
 HEAD_DIM_QK = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 TOPK = 2048
 _LOG2E = 1.4426950408889634
-_SM_SCALE = 0.07216878364870322
 _LSE_CHUNK_SIZE = 64
+
+
+@triton.jit
+def _prepare_indices_kernel(
+    sparse_indices,
+    safe_indices,
+    seq_lens,
+    stride_t: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    token = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    ptrs = sparse_indices + token * stride_t + offs
+    idx = tl.load(ptrs)
+    valid = idx >= 0
+    tl.store(safe_indices + token * stride_t + offs, tl.where(valid, idx, 0))
+    tl.store(seq_lens + token, tl.sum(valid.to(tl.int32), axis=0))
 
 
 def _get_workspace(device):
@@ -59,28 +79,62 @@ def _get_cat_buffers(q_nope, ckv_cache):
     return query_buf[:num_tokens], kv_buf[:num_pages]
 
 
+def _get_index_buffers(sparse_indices):
+    num_tokens = sparse_indices.shape[0]
+    key = (str(sparse_indices.device), sparse_indices.dtype)
+    cached = _index_buffer_cache.get(key)
+    if cached is None:
+        safe_indices = torch.empty((num_tokens, TOPK), dtype=sparse_indices.dtype, device=sparse_indices.device)
+        seq_lens = torch.empty((num_tokens,), dtype=torch.int32, device=sparse_indices.device)
+    else:
+        safe_indices, seq_lens = cached
+        if safe_indices.shape[0] < num_tokens:
+            safe_indices = torch.empty((num_tokens, TOPK), dtype=sparse_indices.dtype, device=sparse_indices.device)
+        if seq_lens.shape[0] < num_tokens:
+            seq_lens = torch.empty((num_tokens,), dtype=torch.int32, device=sparse_indices.device)
+
+    _index_buffer_cache[key] = (safe_indices, seq_lens)
+    return safe_indices[:num_tokens], seq_lens[:num_tokens]
+
+
+def _get_topk_offsets(device):
+    key = str(device)
+    offsets = _offset_cache.get(key)
+    if offsets is None:
+        offsets = torch.arange(TOPK, device=device, dtype=torch.int32)
+        _offset_cache[key] = offsets
+    return offsets
+
+
+def _as_float(scale):
+    if isinstance(scale, torch.Tensor):
+        return float(scale.item())
+    return float(scale)
+
+
 def _compute_lse_fast(
     query_buf,
     kv_cache,
     safe_indices,
-    valid_indices,
+    seq_lens,
     sm_scale,
     lse,
 ):
     kv_all = kv_cache.reshape(-1, HEAD_DIM_QK)
     num_tokens = query_buf.shape[0]
+    topk_offsets = _get_topk_offsets(query_buf.device)
 
     for start in range(0, num_tokens, _LSE_CHUNK_SIZE):
         end = min(start + _LSE_CHUNK_SIZE, num_tokens)
         safe_idx = safe_indices[start:end]
-        valid = valid_indices[start:end]
+        lens = seq_lens[start:end]
 
         k = kv_all[safe_idx]
         q = query_buf[start:end]
 
         logits = torch.bmm(q, k.transpose(1, 2))
         logits.mul_(sm_scale)
-        logits.masked_fill_(~valid[:, None, :], -float("inf"))
+        logits.masked_fill_(topk_offsets[None, None, :] >= lens[:, None, None], -float("inf"))
 
         lse[start:end].copy_(torch.logsumexp(logits, dim=-1).to(torch.float32) * _LOG2E)
 
@@ -89,7 +143,7 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     num_tokens = q_nope.shape[0]
     device = q_nope.device
 
-    bmm1_scale = _SM_SCALE
+    bmm1_scale = _as_float(sm_scale)
 
     if num_tokens == 0:
         return None
@@ -100,9 +154,15 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     query = query_buf.unsqueeze(1)                          # [T, 1, H, ckv+kpe]
     block_tables = sparse_indices.unsqueeze(1)              # [T, 1, topk]
 
-    valid_indices = sparse_indices >= 0
-    seq_lens = valid_indices.sum(dim=1, dtype=torch.int32)
-    safe_indices = sparse_indices.clamp_min(0)
+    safe_indices, seq_lens = _get_index_buffers(sparse_indices)
+    _prepare_indices_kernel[(num_tokens,)](
+        sparse_indices,
+        safe_indices,
+        seq_lens,
+        sparse_indices.stride(0),
+        BLOCK=TOPK,
+        num_warps=8,
+    )
     max_seq_len = TOPK
     workspace = _get_workspace(device)
 
@@ -124,7 +184,7 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
         query_buf,
         kv_cache,
         safe_indices,
-        valid_indices,
+        seq_lens,
         bmm1_scale,
         lse,
     )

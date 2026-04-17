@@ -1,35 +1,71 @@
-import modal
 import subprocess
 
-app = modal.App("fresh-download-dataset")
-vol = modal.Volume.from_name("flashinfer-trace")
+import modal
 
-# 准备包含 git-lfs 的环境
-image = modal.Image.debian_slim().apt_install("git", "git-lfs")
 
-@app.function(volumes={"/data": vol}, image=image, timeout=3600)
-def download_and_organize():
-    print("1. 确保云盘是空的...")
-    subprocess.run("rm -rf /data/*", shell=True)
-    
-    print("2. 开始极速下载官方数据集 (大约需要2-3分钟)...")
-    subprocess.run(["git", "lfs", "install"], check=True)
-    # 先克隆到一个临时文件夹
-    subprocess.run(["git", "clone", "https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest", "/data/temp_repo"], check=True)
-    
-    print("3. 正在将数据提取到根目录...")
-    # 把临时文件夹里的所有东西移到外层根目录
-    subprocess.run("mv /data/temp_repo/* /data/", shell=True)
-    # 删除没用的临时文件夹
-    subprocess.run("rm -rf /data/temp_repo", shell=True)
-    
-    print("4. 下载和整理完成！现在的云盘根目录结构如下：")
-    subprocess.run("ls -la /data", shell=True)
-    
-    # 提交保存到云盘
-    vol.commit()
-    print("5. 完美搞定！可以开始测速了！")
+DATASET_REPO = "https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest"
+TRACE_SET_PATH = "/data"
+TMP_DATASET_PATH = "/tmp/mlsys26-contest"
+
+app = modal.App("refresh-flashinfer-trace")
+volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
+
+image = (
+    modal.Image.debian_slim()
+    .apt_install("git", "git-lfs", "ca-certificates")
+    .env({"GIT_LFS_SKIP_SMUDGE": "0"})
+)
+
+
+def run_cmd(cmd, cwd=None):
+    print(f"$ {' '.join(cmd)}", flush=True)
+    subprocess.run(cmd, cwd=cwd, check=True)
+
+
+@app.function(volumes={TRACE_SET_PATH: volume}, image=image, timeout=7200)
+def refresh_dataset():
+    print("Refreshing Modal volume 'flashinfer-trace' with latest dataset...", flush=True)
+
+    run_cmd(["git", "lfs", "install", "--skip-repo"])
+    run_cmd(["rm", "-rf", TMP_DATASET_PATH])
+    run_cmd(["git", "clone", DATASET_REPO, TMP_DATASET_PATH])
+    run_cmd(["git", "lfs", "pull"], cwd=TMP_DATASET_PATH)
+
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"],
+        cwd=TMP_DATASET_PATH,
+        text=True,
+    ).strip()
+    print(f"Dataset commit: {commit}", flush=True)
+
+    # Remove both normal and hidden entries from the mounted volume root.
+    subprocess.run(
+        f"find {TRACE_SET_PATH} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +",
+        shell=True,
+        check=True,
+    )
+    subprocess.run(
+        f"cp -a {TMP_DATASET_PATH}/. {TRACE_SET_PATH}/",
+        shell=True,
+        check=True,
+    )
+    with open(f"{TRACE_SET_PATH}/DATASET_COMMIT.txt", "w", encoding="utf-8") as f:
+        f.write(commit + "\n")
+
+    print("Top-level dataset layout:", flush=True)
+    subprocess.run(["find", TRACE_SET_PATH, "-maxdepth", "2", "-type", "d"], check=True)
+    print("DSA baseline files, if present:", flush=True)
+    subprocess.run(
+        f"find {TRACE_SET_PATH}/solutions/baseline -maxdepth 2 -type f 2>/dev/null | "
+        "grep -E 'flashinfer_(deepgemm_wrapper_2ba145|wrapper_5af199)' || true",
+        shell=True,
+        check=True,
+    )
+
+    volume.commit()
+    print("Dataset refresh complete and committed to Modal volume.", flush=True)
+
 
 @app.local_entrypoint()
 def main():
-    download_and_organize.remote()
+    refresh_dataset.remote()
