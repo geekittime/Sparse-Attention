@@ -11,6 +11,7 @@ QK_ROPE_HEAD_DIM = 64
 HEAD_DIM_QK = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 TOPK = 2048
 _LOG2E = 1.4426950408889634
+_SM_SCALE = 0.07216878364870322
 _LSE_CHUNK_SIZE = 64
 
 
@@ -58,16 +59,11 @@ def _get_cat_buffers(q_nope, ckv_cache):
     return query_buf[:num_tokens], kv_buf[:num_pages]
 
 
-def _as_float(scale):
-    if isinstance(scale, torch.Tensor):
-        return float(scale.item())
-    return float(scale)
-
-
 def _compute_lse_fast(
     query_buf,
     kv_cache,
-    sparse_indices,
+    safe_indices,
+    valid_indices,
     sm_scale,
     lse,
 ):
@@ -76,9 +72,8 @@ def _compute_lse_fast(
 
     for start in range(0, num_tokens, _LSE_CHUNK_SIZE):
         end = min(start + _LSE_CHUNK_SIZE, num_tokens)
-        idx = sparse_indices[start:end]
-        valid = idx >= 0
-        safe_idx = idx.clamp_min(0)
+        safe_idx = safe_indices[start:end]
+        valid = valid_indices[start:end]
 
         k = kv_all[safe_idx]
         q = query_buf[start:end]
@@ -94,7 +89,7 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     num_tokens = q_nope.shape[0]
     device = q_nope.device
 
-    bmm1_scale = _as_float(sm_scale)
+    bmm1_scale = _SM_SCALE
 
     if num_tokens == 0:
         return None
@@ -105,7 +100,9 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     query = query_buf.unsqueeze(1)                          # [T, 1, H, ckv+kpe]
     block_tables = sparse_indices.unsqueeze(1)              # [T, 1, topk]
 
-    seq_lens = (sparse_indices >= 0).sum(dim=1, dtype=torch.int32)
+    valid_indices = sparse_indices >= 0
+    seq_lens = valid_indices.sum(dim=1, dtype=torch.int32)
+    safe_indices = sparse_indices.clamp_min(0)
     max_seq_len = TOPK
     workspace = _get_workspace(device)
 
@@ -126,7 +123,8 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     _compute_lse_fast(
         query_buf,
         kv_cache,
-        sparse_indices,
+        safe_indices,
+        valid_indices,
         bmm1_scale,
         lse,
     )
