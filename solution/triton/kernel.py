@@ -13,17 +13,12 @@ _LOG2E = 1.4426950408889634
 _partial_cache = {}
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  MULTI-HEAD SPLIT-K  —  one block = all 16 heads × (TOPK/splits) KVs
-#  KV loaded ONCE, reused across all heads via tl.dot (tensor cores)
-# ═══════════════════════════════════════════════════════════════════════
-
 @triton.jit
 def _mh_splitk_kernel(
     q_nope_ptr, q_pe_ptr,
     ckv_ptr, kpe_ptr,
     indices_ptr,
-    pa_ptr, pm_ptr, pl_ptr,            # partial accumulators
+    pa_ptr, pm_ptr, pl_ptr,
     sm_scale_log2,
     num_tokens,
     stride_qn_t, stride_qn_h,
@@ -31,33 +26,31 @@ def _mh_splitk_kernel(
     stride_idx_t,
     stride_pa_s, stride_pa_th,
     stride_pm_s, stride_pm_th,
-    EPS: tl.constexpr,                 # entries per split
-    BK: tl.constexpr,                  # block-K tile
-    D: tl.constexpr,                   # KV_LORA_RANK  = 512
-    R: tl.constexpr,                   # QK_ROPE_DIM   = 64
-    H: tl.constexpr,                   # NUM_HEADS      = 16
+    EPS: tl.constexpr,
+    BK: tl.constexpr,
+    D: tl.constexpr,
+    R: tl.constexpr,
+    H: tl.constexpr,
 ):
     token_id = tl.program_id(0)
     split_id = tl.program_id(1)
     if token_id >= num_tokens:
         return
 
-    heads = tl.arange(0, H)            # [16]
-    d_nope = tl.arange(0, D)           # [512]
-    d_rope = tl.arange(0, R)           # [64]
+    heads = tl.arange(0, H)
+    d_nope = tl.arange(0, D)
+    d_rope = tl.arange(0, R)
 
-    # ── Load queries (all heads) ──────────────────────────────────────
     q_nope = tl.load(
         q_nope_ptr + token_id * stride_qn_t
         + heads[:, None] * stride_qn_h + d_nope[None, :]
-    )                                                       # [H, D]
+    )
     q_pe = tl.load(
         q_pe_ptr + token_id * stride_qp_t
         + heads[:, None] * stride_qp_h + d_rope[None, :]
-    )                                                       # [H, R]
+    )
 
-    # ── Online-softmax state (per head) ───────────────────────────────
-    m_i = tl.full([H], float('-inf'), dtype=tl.float32)
+    m_i = tl.full([H], -3.4028234663852886e38, dtype=tl.float32)
     l_i = tl.zeros([H], dtype=tl.float32)
     acc = tl.zeros([H, D], dtype=tl.float32)
 
@@ -72,40 +65,38 @@ def _mh_splitk_kernel(
         valid = indices >= 0
         safe = tl.where(valid, indices, 0)
 
-        # Gathered KV reads (unmasked — invalid idx → row 0; masked via score)
-        ckv = tl.load(ckv_ptr + (safe * D)[:, None] + d_nope[None, :])    # [BK, D]
-        kpe = tl.load(kpe_ptr + (safe * R)[:, None] + d_rope[None, :])    # [BK, R]
+        ckv = tl.load(ckv_ptr + (safe * D)[:, None] + d_nope[None, :])
+        kpe = tl.load(kpe_ptr + (safe * R)[:, None] + d_rope[None, :])
 
-        # Scores via tensor-core matmul: [H, D]@[D, BK] + [H, R]@[R, BK]
-        s = tl.dot(q_nope, tl.trans(ckv)).to(tl.float32)                  # [H, BK]
+        s = tl.dot(q_nope, tl.trans(ckv)).to(tl.float32)
         s += tl.dot(q_pe, tl.trans(kpe)).to(tl.float32)
         s *= sm_scale_log2
-        s = tl.where(valid[None, :], s, float('-inf'))
+        s = tl.where(valid[None, :], s, -3.4028234663852886e38)
 
-        # Online softmax (exp2-based)
-        m_tile = tl.max(s, axis=1)                          # [H]
+        m_tile = tl.max(s, axis=1)
         m_new = tl.maximum(m_i, m_tile)
-        alpha = tl.math.exp2(m_i - m_new)                   # [H]
-        p = tl.math.exp2(s - m_new[:, None])                # [H, BK]
+        alpha = tl.math.exp2(m_i - m_new)
+        p = tl.math.exp2(s - m_new[:, None])
+        p = tl.where(valid[None, :], p, 0.0)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc *= alpha[:, None]
         m_i = m_new
 
-        # Weighted output:  [H, BK] @ [BK, D] → [H, D]
         acc += tl.dot(p.to(ckv.dtype), ckv).to(tl.float32)
 
-    # ── Store partial results ─────────────────────────────────────────
     base_th = token_id * H
-    for h in tl.static_range(0, H):
-        th = base_th + h
-        tl.store(pa_ptr + split_id * stride_pa_s + th * stride_pa_th + d_nope, acc[h, :])
-        tl.store(pm_ptr + split_id * stride_pm_s + th * stride_pm_th, m_i[h])
-        tl.store(pl_ptr + split_id * stride_pm_s + th * stride_pm_th, l_i[h])
+    th = base_th + heads
+    pa_offsets = (
+        pa_ptr
+        + split_id * stride_pa_s
+        + th[:, None] * stride_pa_th
+        + d_nope[None, :]
+    )
+    stat_offsets = split_id * stride_pm_s + th * stride_pm_th
+    tl.store(pa_offsets, acc)
+    tl.store(pm_ptr + stat_offsets, m_i)
+    tl.store(pl_ptr + stat_offsets, l_i)
 
-
-# ═══════════════════════════════════════════════════════════════════════
-#  REDUCTION  —  merge split-K partials into final output + LSE
-# ═══════════════════════════════════════════════════════════════════════
 
 @triton.jit
 def _reduce_kernel(
@@ -129,7 +120,6 @@ def _reduce_kernel(
     d = tl.arange(0, D)
     th = token_id * H + head_id
 
-    # First split
     acc = tl.load(pa_ptr + 0 * stride_pa_s + th * stride_pa_th + d)
     m_i = tl.load(pm_ptr + 0 * stride_pm_s + th * stride_pm_th)
     l_i = tl.load(pl_ptr + 0 * stride_pm_s + th * stride_pm_th)
@@ -146,16 +136,16 @@ def _reduce_kernel(
         acc = acc * a_old + acc_s * a_new
         m_i = m_new
 
-    acc /= l_i
+    has_data = l_i > 0.0
+    denom = tl.where(has_data, l_i, 1.0)
+    acc /= denom
     o_off = token_id * stride_o_t + head_id * stride_o_h
     tl.store(out_ptr + o_off + d, acc.to(out_ptr.dtype.element_ty))
-    tl.store(lse_ptr + token_id * stride_lse_t + head_id,
-             m_i + tl.math.log2(l_i))
+    tl.store(
+        lse_ptr + token_id * stride_lse_t + head_id,
+        tl.where(has_data, m_i + tl.math.log2(l_i), float('-inf')),
+    )
 
-
-# ═══════════════════════════════════════════════════════════════════════
-#  SINGLE-PASS MULTI-HEAD  —  no split-K (for large batches)
-# ═══════════════════════════════════════════════════════════════════════
 
 @triton.jit
 def _mh_single_kernel(
@@ -193,7 +183,7 @@ def _mh_single_kernel(
         + heads[:, None] * stride_qp_h + d_rope[None, :]
     )
 
-    m_i = tl.full([H], float('-inf'), dtype=tl.float32)
+    m_i = tl.full([H], -3.4028234663852886e38, dtype=tl.float32)
     l_i = tl.zeros([H], dtype=tl.float32)
     acc = tl.zeros([H, D], dtype=tl.float32)
 
@@ -211,28 +201,31 @@ def _mh_single_kernel(
         s = tl.dot(q_nope, tl.trans(ckv)).to(tl.float32)
         s += tl.dot(q_pe, tl.trans(kpe)).to(tl.float32)
         s *= sm_scale_log2
-        s = tl.where(valid[None, :], s, float('-inf'))
+        s = tl.where(valid[None, :], s, -3.4028234663852886e38)
 
         m_tile = tl.max(s, axis=1)
         m_new = tl.maximum(m_i, m_tile)
         alpha = tl.math.exp2(m_i - m_new)
         p = tl.math.exp2(s - m_new[:, None])
+        p = tl.where(valid[None, :], p, 0.0)
         l_i = l_i * alpha + tl.sum(p, axis=1)
         acc *= alpha[:, None]
         m_i = m_new
         acc += tl.dot(p.to(ckv.dtype), ckv).to(tl.float32)
 
-    acc /= l_i[:, None]
-    o_ptrs = (out_ptr + token_id * stride_o_t
-              + heads[:, None] * stride_o_h + d_nope[None, :])
+    has_data = l_i > 0.0
+    denom = tl.where(has_data, l_i, 1.0)
+    acc /= denom[:, None]
+    o_ptrs = (
+        out_ptr + token_id * stride_o_t
+        + heads[:, None] * stride_o_h + d_nope[None, :]
+    )
     tl.store(o_ptrs, acc.to(out_ptr.dtype.element_ty))
-    tl.store(lse_ptr + token_id * stride_lse_t + heads,
-             m_i + tl.math.log2(l_i))
+    tl.store(
+        lse_ptr + token_id * stride_lse_t + heads,
+        tl.where(has_data, m_i + tl.math.log2(l_i), float('-inf')),
+    )
 
-
-# ═══════════════════════════════════════════════════════════════════════
-#  Host helpers
-# ═══════════════════════════════════════════════════════════════════════
 
 def _as_float(scale):
     return float(scale.item()) if isinstance(scale, torch.Tensor) else float(scale)
@@ -253,10 +246,6 @@ def _get_partials(num_tokens, splits, device):
     return pa, pm, pl
 
 
-# ═══════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════
-
 def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, lse):
     num_tokens = q_nope.shape[0]
     if num_tokens == 0:
@@ -265,16 +254,14 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
     device = q_nope.device
     sm_scale_log2 = _as_float(sm_scale) * _LOG2E
 
-    # Zero-copy flatten (both tensors are contiguous from paged KV cache)
     ckv_flat = ckv_cache.view(-1, KV_LORA_RANK)
     kpe_flat = kpe_cache.view(-1, QK_ROPE_HEAD_DIM)
 
-    BK = 16                            # tile size (≥16 for tensor-core tl.dot)
-    NUM_SPLITS = 16                    # split-K parallelism factor
-    EPS = TOPK // NUM_SPLITS           # 128 entries per split
+    BK = 16
+    NUM_SPLITS = 16
+    EPS = TOPK // NUM_SPLITS
 
     if num_tokens >= 16:
-        # ── Large batch: enough blocks from tokens alone ──────────────
         _mh_single_kernel[(num_tokens,)](
             q_nope, q_pe, ckv_flat, kpe_flat, sparse_indices,
             output, lse, sm_scale_log2, num_tokens,
@@ -288,7 +275,6 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
             num_warps=8, num_stages=2,
         )
     else:
-        # ── Small batch: split-K for B200 SM utilisation ──────────────
         pa, pm, pl = _get_partials(num_tokens, NUM_SPLITS, device)
 
         _mh_splitk_kernel[(num_tokens, NUM_SPLITS)](
