@@ -276,6 +276,9 @@ def run(q_nope, q_pe, ckv_cache, kpe_cache, sparse_indices, sm_scale, output, ls
         )
     else:
         pa, pm, pl = _get_partials(num_tokens, NUM_SPLITS, device)
+        pa.zero_()
+        pm.fill_(-3.4028234663852886e38)
+        pl.zero_()
 
         _mh_splitk_kernel[(num_tokens, NUM_SPLITS)](
             q_nope, q_pe, ckv_flat, kpe_flat, sparse_indices,
